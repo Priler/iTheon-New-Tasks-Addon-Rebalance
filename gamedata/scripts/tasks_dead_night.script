@@ -1,0 +1,620 @@
+-- Stage 0: Task has been set up - player needs to get to the Darkscape close to the coded position
+-- Stage 1: Player needs to kill all of the mutants (showing tag only on one of them at a time
+-- to make it harder to cheese through looking at the map)
+-- Stage 2: Player can receive reward from the quest giver
+
+-- Rewritten by: Abraham (Priler)
+-- What's new:
+-- added map marker for this task
+-- small invictibility window while screen is black + further spawns of zombies
+-- better controller spawn logic (+agro)
+-- adaptive difficulty based on player armor (made for gamma but probably should work on vanilla)
+-- performance optimizations (O(1) for hash table access, etc.)
+
+-- Cache frequently used globals as locals (direct access)
+local pairs = pairs
+local ipairs = ipairs
+local math_random = math.random
+local math_ceil = math.ceil
+local math_sqrt = math.sqrt
+local alife_object = alife_object
+local level_object_by_id = level.object_by_id
+local time_global = time_global
+
+local state = {}
+local marker_id = nil
+
+-- Adaptive difficulty settings
+-- maps armor tier to spawn percentage (1.0 = 100% of enemies spawn)
+local DIFFICULTY_TIERS = {
+    low = 0.5,      -- Basic gear: spawn 50% of enemies
+    medium = 0.75,  -- Mid-tier gear: spawn 75% of enemies
+    high = 1.0      -- End-game gear: spawn 100% of enemies
+}
+
+-- Armor sections considered high-tier (Exoskeletons, Nosorogs, Heavy SEVAs)
+-- taken from gamma armor balance mod
+local HIGH_TIER_ARMORS = {
+    -- Nosorogs
+    ["army_nosorog_outfit"] = true,
+    ["dolg_nosorog_outfit"] = true,
+    ["freedom_nosorog_outfit"] = true,
+    ["isg_nosorog_outfit"] = true,
+    ["merc_nosorog_outfit"] = true,
+    ["monolith_nosorog_outfit"] = true,
+    -- Exoskeletons
+    ["exo_outfit"] = true,
+    ["bandit_exo_outfit"] = true,
+    ["cs_exo_outfit"] = true,
+    ["dolg_exo_outfit"] = true,
+    ["ecolog_exo_outfit"] = true,
+    ["greh_exo_outfit"] = true,
+    ["isg_exo_outfit"] = true,
+    ["merc_exo_outfit"] = true,
+    ["military_exo_outfit"] = true,
+    ["monolith_exo_outfit"] = true,
+    ["renegade_exo_outfit"] = true,
+    ["svoboda_exo_outfit"] = true,
+    -- Exolights
+    ["exolight_outfit"] = true,
+    ["exo_wood_outfit"] = true,
+    ["bandit_exolight_outfit"] = true,
+    ["cs_exolight_outfit"] = true,
+    ["dolg_exolight_outfit"] = true,
+    ["exo_dolg_outfit"] = true,
+    ["exo_dolg_red_outfit"] = true,
+    ["exo_dolg_urban_outfit"] = true,
+    ["exo_dolg_wood_outfit"] = true,
+    ["merc_exolight_outfit"] = true,
+    ["exo_merc_grass_outfit"] = true,
+    ["exo_merc_urban_outfit"] = true,
+    ["exo_merc_wood_outfit"] = true,
+    ["isg_exolight_outfit"] = true,
+    ["military_exolight_outfit"] = true,
+    ["monolith_exolight_outfit"] = true,
+    ["svoboda_exolight_outfit"] = true,
+    ["freedom_exo_vineleaf_outfit"] = true,
+    -- Proto Exos
+    ["military_proto_exo_outfit"] = true,
+    ["dolg_heavy_proto_exo_outfit"] = true,
+    ["stalker_proto_exo_outfit"] = true,
+    ["cs_stalker_proto_exo_outfit"] = true,
+    ["dolg_proto_exo_outfit"] = true,
+    ["ecolog_proto_exo_outfit"] = true,
+    ["isg_proto_exo_outfit"] = true,
+    ["monolith_proto_exo_outfit"] = true,
+    ["svoboda_light_proto_exo_outfit"] = true,
+    -- SKAT9 / Heavy Military
+    ["military_outfit"] = true,
+    ["dolg_heavy_outfit"] = true,
+    ["dolg_heavy_redline_outfit"] = true,
+    ["dolg_pantsir_outfit"] = true,
+    ["military_bandit_outfit"] = true,
+    ["military_freedom_outfit"] = true,
+    ["military_merc_outfit"] = true,
+    ["military_monolit_outfit"] = true,
+    ["military_sky_outfit"] = true,
+    -- Heavy Metro
+    ["cs_heavy_outfit"] = true,
+    ["light_dolg_outfit"] = true,
+    ["light_freedom_outfit"] = true,
+    ["light_isg_outfit"] = true,
+    ["light_loner_outfit"] = true,
+    ["light_merc_outfit"] = true,
+    ["light_monolit_outfit"] = true,
+    ["light_voen_outfit"] = true,
+    -- Battle SEVAs
+    ["merc_ace_outfit"] = true,
+    ["merc_combat_scientific_outfit"] = true,
+    ["hybrid_outfit"] = true,
+    -- Ecologist SEVAs (high tier due to psy/rad protection - important vs Controller)
+    ["ecolog_outfit_orange"] = true,
+    ["ecolog_outfit_blue"] = true,
+    ["ecolog_outfit_green"] = true,
+    ["ecolog_outfit_white"] = true,
+    ["ecolog_outfit_yello"] = true,
+    ["ecolog_outfit_red"] = true,
+}
+
+-- Armor sections considered mid-tier (Combat SEVAs, Berills, Medium suits)
+-- taken from gamma armor balance mod
+local MID_TIER_ARMORS = {
+    -- Combat SEVAs
+    ["scientific_outfit"] = true,
+    ["bandit_scientific_dark_outfit"] = true,
+    ["bandit_scientific_outfit"] = true,
+    ["cs_scientific_outfit"] = true,
+    ["cs_scientific_outfit_good"] = true,
+    ["dolg_scientific_outfit"] = true,
+    ["merc_scientific_outfit"] = true,
+    ["monolith_scientific_light_outfit"] = true,
+    ["monolith_scientific_outfit"] = true,
+    ["renegade_scientific_outfit"] = true,
+    ["svoboda_scientific_outfit"] = true,
+    ["dolg_scientific_wood_outfit"] = true,
+    ["dolg_scientific_red_outfit"] = true,
+    ["isg_scientific_outfit"] = true,
+    ["merc_scientific_armored_outfit"] = true,
+    -- Berills
+    ["svoboda_heavy_outfit"] = true,
+    ["cs_medium_outfit"] = true,
+    ["dolg_voin_outfit"] = true,
+    ["specops_outfit"] = true,
+    ["dolg_specops_red_outfit"] = true,
+    ["specops_bandit_outfit"] = true,
+    ["specops_dolg_outfit"] = true,
+    ["specops_merc_outfit"] = true,
+    -- LCS (Light Combat Suits)
+    ["merc_outfit"] = true,
+    ["merc_jackal_outfit"] = true,
+    ["merc_sunset_outfit"] = true,
+    ["merc_coyote_outfit"] = true,
+    ["greh_armored_outfit"] = true,
+    ["greh_armored_camo_outfit"] = true,
+    ["isg_lcs_outfit"] = true,
+    ["isg_lcs_urban_outfit"] = true,
+    ["renegademerc_outfit"] = true,
+    -- PS5 suits
+    ["dolg_outfit"] = true,
+    ["dolg_red_outfit"] = true,
+    ["dolg_scout_outfit"] = true,
+    ["greh_ps5_outfit"] = true,
+    ["svoboda_heavy_outfit_2"] = true,
+    ["bandit_ps5_outfit"] = true,
+    -- Voyager/Special Medium
+    ["nomad_outfit"] = true,
+    ["travel_outfit"] = true,
+    ["wastelander_outfit"] = true,
+    ["ghillie_outfit"] = true,
+    ["merc_nighthunter_outfit"] = true,
+    -- STS Tactical
+    ["bandit_sun_outfit"] = true,
+    ["isg_outfit"] = true,
+    ["isg_camo_outfit"] = true,
+    ["merc_sun_outfit"] = true,
+    ["monolith_outfit"] = true,
+    ["svoboda_light_outfit"] = true,
+    -- Sunrise suits
+    ["stalker_bear_outfit"] = true,
+    ["stalker_drought_outfit"] = true,
+    ["stalker_graphite_outfit"] = true,
+    ["stalker_tigerstripe_outfit"] = true,
+    ["stalker_outfit"] = true,
+    ["stalker_autumn_outfit"] = true,
+    ["stalker_salamander_outfit"] = true,
+    ["merc_scout_outfit"] = true,
+    ["merc_fighter_outfit"] = true,
+    ["army_outfit"] = true,
+    ["cs_light_novice_outfit"] = true,
+}
+
+-- Get player's difficulty tier based on equipped armor
+function get_player_difficulty_tier()
+    local outfit = db.actor:item_in_slot(7)  -- Outfit slot
+    if not outfit then return "low" end
+    
+    local section = outfit:section()
+    
+    -- Direct lookup first (O(1) - fast for exact matches)
+    if HIGH_TIER_ARMORS[section] then return "high" end
+    if MID_TIER_ARMORS[section] then return "medium" end
+    
+    -- Only do pattern matching for upgraded variants (e.g., "exo_outfit_up1")
+    -- Check high tier patterns
+    for armor_section in pairs(HIGH_TIER_ARMORS) do
+        if string.sub(section, 1, #armor_section) == armor_section then
+            return "high"
+        end
+    end
+    
+    -- Check mid tier patterns
+    for armor_section in pairs(MID_TIER_ARMORS) do
+        if string.sub(section, 1, #armor_section) == armor_section then
+            return "medium"
+        end
+    end
+    
+    return "low"
+end
+
+-- Determine how many enemies to spawn based on player gear
+function get_spawn_multiplier()
+    local tier = get_player_difficulty_tier()
+    return DIFFICULTY_TIERS[tier] or 1.0
+end
+
+function save_state(mdata)
+    mdata.dead_night_task_data = state
+    mdata.dead_night_marker_id = marker_id
+end
+
+function load_state(mdata)
+    if mdata.dead_night_task_data then
+        state = mdata.dead_night_task_data
+    end
+    if mdata.dead_night_marker_id then
+        marker_id = mdata.dead_night_marker_id
+    end
+end
+
+-- Spawn invisible marker object at the trigger location
+-- mid game works fine too
+-- means if the mod installed after the task taken, marker still will spawn
+function ensure_marker_exists()
+    -- Check if marker already exists and is valid
+    if marker_id then
+        local se_obj = alife_object(marker_id)
+        if se_obj then
+            return marker_id
+        end
+    end
+    
+    -- Spawn a new marker object (using a small common item)
+    local spawn_section = "bolt"  -- universal small item, exists in all Stalker games
+    local pos = dead_night_configs.spawn_trigger
+    
+    -- Find suitable lvid and gvid from nearby spawn configs
+    local lvid = 139350
+    local gvid = 1159
+    
+    local se_obj = alife_create(spawn_section, pos, lvid, gvid)
+    if se_obj then
+        marker_id = se_obj.id
+        return marker_id
+    end
+    
+    return nil
+end
+
+-- Remove the marker object
+function remove_marker()
+    if marker_id then
+        local se_obj = alife_object(marker_id)
+        if se_obj then
+            alife_release(se_obj)
+        end
+        marker_id = nil
+    end
+end
+
+-- Grant temporary invulnerability to player
+-- just in case zombie will spawn too close and hit the player while screen is black (bruh)
+local PROTECTION_DURATION = 5
+
+function protect_player()
+    db.actor.invulnerable = true
+    
+    -- Remove protection after delay
+    CreateTimeEvent("dead_night", "remove_protection", PROTECTION_DURATION, function()
+        if db.actor then
+            db.actor.invulnerable = false
+        end
+        return true  -- Remove this time event
+    end)
+end
+
+-- main function of the task
+task_status_functor.dead_night_task_status_functor = function(tsk, task_id)
+    if not (db.actor and tsk) then return end
+    local stage = tsk.stage
+    
+    if (stage == 0) then
+        -- Ensure marker exists for stage 0 (handles mid-game install)
+        ensure_marker_exists()
+        
+        if nta_utils.actor_on_level(nta_utils.levels.darkscape) and nta_utils.is_dark_night() then
+            if nta_utils.actor_in_range(dead_night_configs.spawn_trigger, 12) then
+                -- Clean up marker before spawning mutants
+                remove_marker()
+                
+                -- Protect player during spawn/fade
+                protect_player()
+                
+                spawn()
+                level.add_pp_effector("fade_in.ppe", 200, false)
+                tsk.stage = 1
+            else
+                spawn_sound()
+            end
+        end
+    end
+    
+    if (stage == 1) then
+        if not nta_utils.actor_on_level(nta_utils.levels.darkscape) then return 'fail' end
+        if #state == 0 then
+            tsk.stage = 2
+        end
+    end
+end
+
+-- distance to push spawns away from player (meters)
+local SPAWN_DISTANCE_OFFSET = 15
+
+-- controller spawn delay range (seconds)
+local CONTROLLER_DELAY_MIN = 5
+local CONTROLLER_DELAY_MAX = 10
+
+function spawn()
+    local actor_pos = db.actor:position()
+    
+    -- Play scream sound when spawn starts
+    -- nta_utils.spawn_sound_at_position([[new_tasks_addon\scream_1_shrike]], dead_night_configs.spawn_trigger)
+    
+    -- Get spawn multiplier based on player gear
+    local spawn_multiplier = get_spawn_multiplier()
+    
+    -- Separate regular enemies from special enemies (controller, blind zombies)
+    local regular_spawns = {}
+    local special_spawns = {}
+    local regular_count = 0
+    
+    for _, spawn_config in ipairs(dead_night_configs.spawn_configs) do
+        -- Get section without mutating original config
+        local section = spawn_config.section_func()
+        
+        if section == "m_controller_normal" or section == "zombie_blind" then
+            special_spawns[#special_spawns + 1] = { config = spawn_config, section = section }
+        else
+            regular_count = regular_count + 1
+            regular_spawns[regular_count] = { config = spawn_config, section = section }
+        end
+    end
+    
+    -- apply adaptive difficulty to regular spawns only
+    local num_regular_to_spawn = math_ceil(regular_count * spawn_multiplier)
+    
+    -- everyday I'm shuffling, baby
+    shuffle_table(regular_spawns)
+    
+    -- spawn regular enemies
+    for i = 1, num_regular_to_spawn do
+        local spawn_data = regular_spawns[i]
+        if spawn_data then
+            spawn_single_enemy(spawn_data.config, spawn_data.section, actor_pos)
+        end
+    end
+    
+    -- spawn special enemies (blind zombies immediately, controller delayed randomly)
+    for i = 1, #special_spawns do
+        local spawn_data = special_spawns[i]
+        if spawn_data.section == "m_controller_normal" then
+            local delay = math_random(CONTROLLER_DELAY_MIN, CONTROLLER_DELAY_MAX)
+            
+            -- Store values directly in closure to avoid table copy
+            local config = spawn_data.config
+            local section = spawn_data.section
+            
+            CreateTimeEvent("dead_night", "spawn_controller_" .. math_random(1000, 9999), delay, function()
+                -- spawn controller at original position (no offset)
+                local spawned_id = nta_utils.spawn_helper({
+                    vector = config.vector,
+                    lvid = config.lvid,
+                    gvid = config.gvid,
+                    section = section
+                })
+                
+                if spawned_id then
+                    state[#state + 1] = spawned_id
+                    -- start persistent aggro mechanism (idk for some reason sometimes controllers "frozes" in place without attacking the player tf)
+                    start_controller_aggro(spawned_id)
+                end
+                return true
+            end)
+        else
+            -- blind zombies spawn immediately
+            spawn_single_enemy(spawn_data.config, spawn_data.section, actor_pos)
+        end
+    end
+end
+
+-- keep controller aggressive by periodically hitting it (keep the agro)
+function start_controller_aggro(controller_id)
+    local aggro_event_id = "controller_aggro_" .. controller_id
+    
+    CreateTimeEvent("dead_night", aggro_event_id, 0.5, function()
+        -- Check if controller still exists and is alive
+        local monster = level_object_by_id(controller_id)
+        if not monster then
+            return true  -- Controller gone, stop aggro loop
+        end
+        
+        local se_obj = alife_object(controller_id)
+        if not se_obj or not se_obj:alive() then
+            return true  -- Controller dead, stop aggro loop
+        end
+        
+        -- Check if player exists
+        if not db.actor then
+            return true  -- No player, stop
+        end
+        
+        -- Hit the controller to maintain aggro
+        local h = hit()
+        h.power = 0.0001  -- Near-zero damage
+        h.impulse = 0
+        h.draftsman = db.actor
+        
+        local actor_pos = db.actor:position()
+        local monster_pos = monster:position()
+        h.direction = vector():set(
+            monster_pos.x - actor_pos.x,
+            monster_pos.y - actor_pos.y,
+            monster_pos.z - actor_pos.z
+        )
+        
+        h.type = hit.wound
+        monster:hit(h)
+        
+        -- Continue aggro loop every 1.5 seconds
+        ResetTimeEvent("dead_night", aggro_event_id, 1.5)
+        return false  -- Keep event alive
+    end)
+end
+
+-- shuffle a table randomly (Fisher-Yates algorithm)
+function shuffle_table(t)
+    for i = #t, 2, -1 do
+        local j = math_random(i)
+        t[i], t[j] = t[j], t[i]
+    end
+end
+
+-- Spawn a single enemy with offset from player
+-- section: the enemy section to spawn
+-- extra_offset: additional distance for special enemies like controller
+-- make_aggressive: if true, make the enemy target the player immediately
+function spawn_single_enemy(spawn_config, section, actor_pos, extra_offset, make_aggressive)
+    extra_offset = extra_offset or 0
+    local total_offset = SPAWN_DISTANCE_OFFSET + extra_offset
+    
+    -- Calculate direction away from player and offset spawn position
+    local spawn_pos = spawn_config.vector
+    local dir_x = spawn_pos.x - actor_pos.x
+    local dir_z = spawn_pos.z - actor_pos.z
+    local dist = math_sqrt(dir_x * dir_x + dir_z * dir_z)
+    
+    local spawned_id = nil
+    
+    if dist > 0.1 then
+        -- Normalize and apply offset
+        local inv_dist = 1 / dist
+        dir_x = dir_x * inv_dist
+        dir_z = dir_z * inv_dist
+        
+        -- Create new position pushed further away from player
+        local offset_pos = vector():set(
+            spawn_pos.x + dir_x * total_offset,
+            spawn_pos.y,
+            spawn_pos.z + dir_z * total_offset
+        )
+        
+        -- Use offset position for spawn
+        spawned_id = nta_utils.spawn_helper({
+            vector = offset_pos,
+            lvid = spawn_config.lvid,
+            gvid = spawn_config.gvid,
+            section = section
+        })
+    else
+        -- Fallback if somehow player is exactly at spawn point
+        spawned_id = nta_utils.spawn_helper({
+            vector = spawn_pos,
+            lvid = spawn_config.lvid,
+            gvid = spawn_config.gvid,
+            section = section
+        })
+    end
+    
+    if spawned_id then
+        state[#state + 1] = spawned_id
+        
+        -- Make enemy aggressive toward player
+        if make_aggressive then
+            -- Delay slightly to ensure monster is fully initialized
+            CreateTimeEvent("dead_night", "aggro_" .. spawned_id, 0.5, function()
+                local monster = level_object_by_id(spawned_id)
+                if monster and db.actor then
+                    -- Hit the monster with tiny damage from player's direction to trigger aggro
+                    local h = hit()
+                    h.power = 0.001  -- Minimal damage
+                    h.impulse = 0
+                    h.draftsman = db.actor
+                    
+                    -- Calculate direction from actor to monster manually
+                    local actor_pos = db.actor:position()
+                    local monster_pos = monster:position()
+                    h.direction = vector():set(
+                        monster_pos.x - actor_pos.x,
+                        monster_pos.y - actor_pos.y,
+                        monster_pos.z - actor_pos.z
+                    )
+                    
+                    h.type = hit.wound
+                    monster:hit(h)
+                end
+                return true
+            end)
+        end
+    end
+    
+    return spawned_id
+end
+
+local iterations = 0
+function spawn_sound()
+    iterations = iterations + 1
+    if iterations % 10 == 0 then
+        nta_utils.spawn_sound_at_position([[new_tasks_addon\scream_1_shrike]], dead_night_configs.spawn_trigger)
+        iterations = 0
+    end
+end
+
+-- cache for current target to avoid repeated lookups
+local cached_target_id = nil
+local cached_target_valid_until = 0
+
+task_functor.dead_night_task_target_functor = function(task_id, field, p, tsk)
+    if not (db.actor and tsk) then return nil end
+    local stage = tsk.stage
+    
+    if stage == 0 then
+        return ensure_marker_exists()
+        
+    elseif stage == 1 then
+        if not nta_utils.actor_on_level(nta_utils.levels.darkscape) then return nil end
+        
+        -- Use cached target if still valid
+        local current_time = time_global()
+        if cached_target_id and current_time < cached_target_valid_until then
+            local se_obj = alife_object(cached_target_id)
+            if se_obj and se_obj:alive() then
+                return cached_target_id
+            end
+        end
+        
+        -- Find new valid target
+        for _, id in ipairs(state) do
+            local se_obj = alife_object(id)
+            if se_obj and se_obj:alive() then
+                cached_target_id = id
+                cached_target_valid_until = current_time + 1000  -- Cache for 1 second
+                return id
+            end
+        end
+        cached_target_id = nil
+        return nil
+        
+    elseif stage == 2 then
+        return tsk.task_giver_id
+    end
+    
+    return nil
+end
+
+xr_effects.dead_night_cleanup = function()
+    state = {}
+    cached_target_id = nil
+    cached_target_valid_until = 0
+    remove_marker()
+end
+
+function on_game_start()
+    RegisterScriptCallback("save_state", save_state)
+    RegisterScriptCallback("load_state", load_state)
+    RegisterScriptCallback("monster_on_death_callback", monster_on_death_callback)
+end
+
+function monster_on_death_callback(monster)
+    -- Early exit if no monster or state is empty (task not active)
+    if not monster or #state == 0 then return end
+    
+    local id = monster:id()
+    
+    -- Find and remove the ID efficiently (in-place)
+    for i = #state, 1, -1 do
+        if state[i] == id then
+            table.remove(state, i)
+            return  -- Found and removed, exit early
+        end
+    end
+end

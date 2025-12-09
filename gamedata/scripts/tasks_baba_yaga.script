@@ -1,0 +1,593 @@
+-- Baba Yaga Quest
+-- Stage 0: Travel to Garbage near jelly smart terrain, artifact spawns at night
+-- Stage 1: Pick up artifact or try to leave - get teleported to fight
+-- Stage 2: Kill Baba Yaga (can't escape)
+-- Stage 3: Return to quest giver for reward
+
+-- Rewritten by: Abraham (Priler)
+-- What's new:
+-- small invictibility window while screen is black + after task is completed
+-- adaptive quest difficulty based on player armor and player PSY protection
+-- hag won't "disappear" anymore, instead she will go kaboom (also she drops some nice loot)
+
+-- Cache frequently used globals as locals (faster access in Lua)
+local pairs = pairs
+local ipairs = ipairs
+local math_random = math.random
+local string_sub = string.sub
+local alife_object = alife_object
+local alife_create = alife_create
+local level_object_by_id = level.object_by_id
+local CreateTimeEvent = CreateTimeEvent
+local vector = vector
+
+local jelly_smart_terrain = "gar_smart_terrain_5_6"
+
+local state = {
+    art_id = nil,
+    was_teleported = false,
+    hag_id = nil,
+}
+
+-- Adaptive difficulty settings
+local DIFFICULTY = {
+    easy = {
+        karlik_count = 1,
+        hag_health_multiplier = 0.3  -- ~1/4 of base health
+    },
+    medium = {
+        karlik_count = 2,
+        hag_health_multiplier = 0.6   -- ~2/4 of base health
+    },
+    hard = {
+        karlik_count = 4,
+        hag_health_multiplier = 1.0   -- Full health
+    }
+}
+
+-- PSY protection thresholds (as percentage)
+-- Note: for some reason our reading is slightly higher than UI display (so we apply ~1.4x factor)
+-- UI 20% ≈ our 28%, UI 40% ≈ our 56%
+-- maybe that's because GAMMA's caps (idk)
+local PSY_THRESHOLD_MEDIUM = 28  -- Below 28% = easy (UI ~20%)
+local PSY_THRESHOLD_HARD = 56    -- Above 56% = hard (UI ~40%)
+
+-- Max karliks for low armor tier players (regardless of psy protection)
+local LOW_ARMOR_MAX_KARLIKS = 2
+
+-- Protection duration during teleport (seconds)
+local PROTECTION_DURATION = 3
+
+-- Grant temporary invulnerability to player (just to be sure everything's fine)
+function protect_player()
+    db.actor.invulnerable = true
+    
+    CreateTimeEvent("baba_yaga", "remove_protection", PROTECTION_DURATION, function()
+        if db.actor then
+            db.actor.invulnerable = false
+        end
+        return true
+    end)
+end
+
+-- Armor sections considered high-tier (Exoskeletons, Nosorogs, Heavy SEVAs)
+local HIGH_TIER_ARMORS = {
+    -- Nosorogs
+    ["army_nosorog_outfit"] = true,
+    ["dolg_nosorog_outfit"] = true,
+    ["freedom_nosorog_outfit"] = true,
+    ["isg_nosorog_outfit"] = true,
+    ["merc_nosorog_outfit"] = true,
+    ["monolith_nosorog_outfit"] = true,
+    -- Exoskeletons
+    ["exo_outfit"] = true,
+    ["bandit_exo_outfit"] = true,
+    ["cs_exo_outfit"] = true,
+    ["dolg_exo_outfit"] = true,
+    ["ecolog_exo_outfit"] = true,
+    ["greh_exo_outfit"] = true,
+    ["isg_exo_outfit"] = true,
+    ["merc_exo_outfit"] = true,
+    ["military_exo_outfit"] = true,
+    ["monolith_exo_outfit"] = true,
+    ["renegade_exo_outfit"] = true,
+    ["svoboda_exo_outfit"] = true,
+    -- Exolights
+    ["exolight_outfit"] = true,
+    ["exo_wood_outfit"] = true,
+    ["bandit_exolight_outfit"] = true,
+    ["cs_exolight_outfit"] = true,
+    ["dolg_exolight_outfit"] = true,
+    ["exo_dolg_outfit"] = true,
+    ["exo_dolg_red_outfit"] = true,
+    ["exo_dolg_urban_outfit"] = true,
+    ["exo_dolg_wood_outfit"] = true,
+    ["merc_exolight_outfit"] = true,
+    ["exo_merc_grass_outfit"] = true,
+    ["exo_merc_urban_outfit"] = true,
+    ["exo_merc_wood_outfit"] = true,
+    ["isg_exolight_outfit"] = true,
+    ["military_exolight_outfit"] = true,
+    ["monolith_exolight_outfit"] = true,
+    ["svoboda_exolight_outfit"] = true,
+    ["freedom_exo_vineleaf_outfit"] = true,
+    -- Proto Exos
+    ["military_proto_exo_outfit"] = true,
+    ["dolg_heavy_proto_exo_outfit"] = true,
+    ["stalker_proto_exo_outfit"] = true,
+    ["cs_stalker_proto_exo_outfit"] = true,
+    ["dolg_proto_exo_outfit"] = true,
+    ["ecolog_proto_exo_outfit"] = true,
+    ["isg_proto_exo_outfit"] = true,
+    ["monolith_proto_exo_outfit"] = true,
+    ["svoboda_light_proto_exo_outfit"] = true,
+    -- SKAT9 / Heavy Military
+    ["military_outfit"] = true,
+    ["dolg_heavy_outfit"] = true,
+    ["dolg_heavy_redline_outfit"] = true,
+    ["dolg_pantsir_outfit"] = true,
+    ["military_bandit_outfit"] = true,
+    ["military_freedom_outfit"] = true,
+    ["military_merc_outfit"] = true,
+    ["military_monolit_outfit"] = true,
+    ["military_sky_outfit"] = true,
+    -- Heavy Metro
+    ["cs_heavy_outfit"] = true,
+    ["light_dolg_outfit"] = true,
+    ["light_freedom_outfit"] = true,
+    ["light_isg_outfit"] = true,
+    ["light_loner_outfit"] = true,
+    ["light_merc_outfit"] = true,
+    ["light_monolit_outfit"] = true,
+    ["light_voen_outfit"] = true,
+    -- Battle SEVAs
+    ["merc_ace_outfit"] = true,
+    ["merc_combat_scientific_outfit"] = true,
+    ["hybrid_outfit"] = true,
+    -- Ecologist SEVAs (high tier due to psy/rad protection)
+    ["ecolog_outfit_orange"] = true,
+    ["ecolog_outfit_blue"] = true,
+    ["ecolog_outfit_green"] = true,
+    ["ecolog_outfit_white"] = true,
+    ["ecolog_outfit_yello"] = true,
+    ["ecolog_outfit_red"] = true,
+}
+
+-- Armor sections considered mid-tier (Combat SEVAs, Berills, Medium suits)
+local MID_TIER_ARMORS = {
+    -- Combat SEVAs
+    ["scientific_outfit"] = true,
+    ["bandit_scientific_dark_outfit"] = true,
+    ["bandit_scientific_outfit"] = true,
+    ["cs_scientific_outfit"] = true,
+    ["cs_scientific_outfit_good"] = true,
+    ["dolg_scientific_outfit"] = true,
+    ["merc_scientific_outfit"] = true,
+    ["monolith_scientific_light_outfit"] = true,
+    ["monolith_scientific_outfit"] = true,
+    ["renegade_scientific_outfit"] = true,
+    ["svoboda_scientific_outfit"] = true,
+    ["dolg_scientific_wood_outfit"] = true,
+    ["dolg_scientific_red_outfit"] = true,
+    ["isg_scientific_outfit"] = true,
+    ["merc_scientific_armored_outfit"] = true,
+    -- Berills
+    ["svoboda_heavy_outfit"] = true,
+    ["cs_medium_outfit"] = true,
+    ["dolg_voin_outfit"] = true,
+    ["specops_outfit"] = true,
+    ["dolg_specops_red_outfit"] = true,
+    ["specops_bandit_outfit"] = true,
+    ["specops_dolg_outfit"] = true,
+    ["specops_merc_outfit"] = true,
+    -- LCS (Light Combat Suits)
+    ["merc_outfit"] = true,
+    ["merc_jackal_outfit"] = true,
+    ["merc_sunset_outfit"] = true,
+    ["merc_coyote_outfit"] = true,
+    ["greh_armored_outfit"] = true,
+    ["greh_armored_camo_outfit"] = true,
+    ["isg_lcs_outfit"] = true,
+    ["isg_lcs_urban_outfit"] = true,
+    ["renegademerc_outfit"] = true,
+    -- PS5 suits
+    ["dolg_outfit"] = true,
+    ["dolg_red_outfit"] = true,
+    ["dolg_scout_outfit"] = true,
+    ["greh_ps5_outfit"] = true,
+    ["svoboda_heavy_outfit_2"] = true,
+    ["bandit_ps5_outfit"] = true,
+    -- Voyager/Special Medium
+    ["nomad_outfit"] = true,
+    ["travel_outfit"] = true,
+    ["wastelander_outfit"] = true,
+    ["ghillie_outfit"] = true,
+    ["merc_nighthunter_outfit"] = true,
+    -- STS Tactical
+    ["bandit_sun_outfit"] = true,
+    ["isg_outfit"] = true,
+    ["isg_camo_outfit"] = true,
+    ["merc_sun_outfit"] = true,
+    ["monolith_outfit"] = true,
+    ["svoboda_light_outfit"] = true,
+    -- Sunrise suits
+    ["stalker_bear_outfit"] = true,
+    ["stalker_drought_outfit"] = true,
+    ["stalker_graphite_outfit"] = true,
+    ["stalker_tigerstripe_outfit"] = true,
+    ["stalker_outfit"] = true,
+    ["stalker_autumn_outfit"] = true,
+    ["stalker_salamander_outfit"] = true,
+    ["merc_scout_outfit"] = true,
+    ["merc_fighter_outfit"] = true,
+    ["army_outfit"] = true,
+    ["cs_light_novice_outfit"] = true,
+}
+
+-- Get player's armor tier
+function get_armor_tier()
+    local outfit = db.actor:item_in_slot(7)
+    if not outfit then return "low" end
+    
+    local section = outfit:section()
+    
+    -- Direct lookup first (O(1))
+    if HIGH_TIER_ARMORS[section] then return "high" end
+    if MID_TIER_ARMORS[section] then return "medium" end
+    
+    -- Pattern matching for upgraded variants
+    for armor_section in pairs(HIGH_TIER_ARMORS) do
+        if string_sub(section, 1, #armor_section) == armor_section then
+            return "high"
+        end
+    end
+    
+    for armor_section in pairs(MID_TIER_ARMORS) do
+        if string_sub(section, 1, #armor_section) == armor_section then
+            return "medium"
+        end
+    end
+    
+    return "low"
+end
+
+-- Get player's total PSY protection (returns percentage matching game UI)
+function get_player_psy_protection()
+    local hit_type_psy = HitTypeID["Telepatic"]
+    local actor = db.actor
+    
+    local psy_outfit = 0
+    local psy_helmet = 0
+    local psy_artifacts = 0
+    local psy_boosters = 0
+    
+    -- Outfit protection
+    local outfit = actor:item_in_slot(7)
+    if outfit then
+        local c_obj = outfit:cast_CustomOutfit()
+        if c_obj then
+            psy_outfit = c_obj:GetDefHitTypeProtection(hit_type_psy) or 0
+        end
+    end
+    
+    -- Helmet protection
+    local helm = actor:item_in_slot(12)
+    if helm then
+        local c_obj = helm:cast_Helmet()
+        if c_obj then
+            psy_helmet = c_obj:GetDefHitTypeProtection(hit_type_psy) or 0
+        end
+    end
+    
+    -- Artefacts protection
+    actor:iterate_belt(function(owner, obj)
+        local cond = obj:condition()
+        local immunities_sec = SYS_GetParam(0, obj:section(), "hit_absorbation_sect")
+        local prot = SYS_GetParam(2, immunities_sec, "telepatic_immunity", 0) * cond
+        psy_artifacts = psy_artifacts + prot
+    end)
+    
+    -- Booster protection (drugs, mutant parts, etc.)
+    actor:cast_Actor():conditions():BoosterForEach(function(booster_type, booster_time, booster_value)
+        if booster_type == BoosterID["TelepaticProtection"] then
+            psy_boosters = psy_boosters + booster_value
+        end
+    end)
+    
+    local total = psy_outfit + psy_helmet + psy_artifacts + psy_boosters
+    
+    -- UI divides by psi_zone_max_power to get percentage (0-1 range)
+    local psi_max = SYS_GetParam(2, "actor_condition", "psi_zone_max_power") or 1
+    local psi_percentage = (total / psi_max) * 100
+    
+    return psi_percentage
+end
+
+-- Determine difficulty based on PSY protection and armor tier
+function get_difficulty()
+    local psy = get_player_psy_protection()
+    local armor_tier = get_armor_tier()
+    
+    -- Determine base difficulty from PSY protection
+    local difficulty_level
+    if psy < PSY_THRESHOLD_MEDIUM then
+        difficulty_level = "easy"
+    elseif psy < PSY_THRESHOLD_HARD then
+        difficulty_level = "medium"
+    else
+        difficulty_level = "hard"
+    end
+    
+    -- Get base settings for this difficulty
+    local settings = DIFFICULTY[difficulty_level]
+    local karlik_count = settings.karlik_count
+    local hag_health = settings.hag_health_multiplier
+    
+    -- Cap difficulty for low armor tier players
+    if armor_tier == "low" then
+        -- Cap karliks
+        if karlik_count > LOW_ARMOR_MAX_KARLIKS then
+            karlik_count = LOW_ARMOR_MAX_KARLIKS
+        end
+        -- Also reduce hag health for low armor (cap at medium difficulty health)
+        if hag_health > DIFFICULTY.medium.hag_health_multiplier then
+            hag_health = DIFFICULTY.medium.hag_health_multiplier
+        end
+        -- Cap difficulty level for loot purposes
+        if difficulty_level == "hard" then
+            difficulty_level = "medium"
+        end
+    end
+    
+    return {
+        level = difficulty_level,
+        karlik_count = karlik_count,
+        hag_health_multiplier = hag_health
+    }
+end
+
+function save_state(mdata)
+    mdata.baba_yaga_task_data = state
+end
+
+function load_state(mdata)
+    if mdata.baba_yaga_task_data then
+        state = mdata.baba_yaga_task_data
+    end
+end
+
+task_status_functor.baba_yaga_task_status_functor = function(tsk, task_id)
+    if not (db.actor and tsk) then return end
+    local stage = tsk.stage
+
+    if stage == 0 then
+        if nta_utils.actor_on_level(nta_utils.levels.garbage)
+            and db.actor:position():distance_to(baba_yaga_configs.art_location.vector) < 25
+            and nta_utils.is_dark_night()
+        then
+            baba_yaga_configs.art_location.section = baba_yaga_configs.art_sections[math_random(#baba_yaga_configs.art_sections)]
+            state.art_id = nta_utils.spawn_helper(baba_yaga_configs.art_location)
+            tsk.stage = 1
+        end
+    elseif stage == 1 then
+        -- If player tries to leave, teleport anyway
+        if db.actor:position():distance_to(baba_yaga_configs.art_location.vector) > 50 and not state.was_teleported then
+            state.was_teleported = true
+            teleport()
+            spawn()
+            tsk.stage = 2
+        end
+
+        if state.hag_id then
+            tsk.stage = 2
+        end
+    elseif stage == 2 then
+        if db.actor:position():distance_to(baba_yaga_configs.teleport_to_location.vector) > 35 then
+            teleport()
+        end
+        if not state.hag_id then
+            tsk.stage = 3
+        end
+    end
+end
+
+function spawn()
+    local difficulty = get_difficulty()
+    
+    -- Spawn Baba Yaga
+    state.hag_id = nta_utils.spawn_helper(baba_yaga_configs.hag_spot)
+    
+    -- Adjust Baba Yaga's health based on difficulty
+    if state.hag_id and difficulty.hag_health_multiplier < 1.0 then
+        -- Delay to ensure monster is fully initialized
+        CreateTimeEvent("baba_yaga", "adjust_health", 0.5, function()
+            local hag = level_object_by_id(state.hag_id)
+            if hag then
+                -- set_health_ex expects value 0-1 (percentage of max health)
+                -- So 0.25 = 25% health, 0.5 = 50% health, etc.
+                hag:set_health_ex(difficulty.hag_health_multiplier)
+            end
+            return true
+        end)
+    end
+    
+    -- Spawn Karliks based on difficulty
+    local karlik_count = difficulty.karlik_count
+    local available_spots = #baba_yaga_configs.karlik_spots
+    
+    for i = 1, karlik_count do
+        -- Cycle through available spots if we need more karliks than spots
+        local spot_index = ((i - 1) % available_spots) + 1
+        local spawn_config = baba_yaga_configs.karlik_spots[spot_index]
+        if spawn_config then
+            nta_utils.spawn_helper(spawn_config)
+        end
+    end
+end
+
+task_functor.baba_yaga_task_target_functor = function(task_id, field, p, tsk)
+    if not (db.actor and tsk) then return nil end
+    local stage = tsk.stage
+
+    if stage == 0 then
+        return SIMBOARD:get_smart_by_name(jelly_smart_terrain).id
+    elseif stage == 1 then
+        return state.art_id
+    elseif stage == 2 then
+        return state.hag_id
+    elseif stage == 3 then
+        return tsk.task_giver_id
+    end
+    
+    return nil
+end
+
+xr_effects.baba_yaga_cleanup = function()
+    state = {
+        art_id = nil,
+        was_teleported = false,
+        hag_id = nil
+    }
+end
+
+function teleport()
+    protect_player()
+    nta_utils.teleport_visual()
+    db.actor:set_actor_position(baba_yaga_configs.teleport_to_location.vector)
+end
+
+function actor_on_item_take(item)
+    -- Early exit if quest not active or already teleported
+    if not state.art_id or state.was_teleported then return end
+    
+    if item:id() == state.art_id then
+        state.was_teleported = true
+        teleport()
+        spawn()
+    end
+end
+
+-- Loot items pool
+local LOOT_ZOMBIE_HAND = "mutant_part_zombi_hand"
+local LOOT_CONTROLLER_BRAIN = "mutant_part_controller_glass"
+local LOOT_ARTIFACTS = { "af_black_angel", "af_kogot", "af_spaika" }
+local LOOT_BONUS_ITEMS = { "af_black_angel", "af_kogot", "af_spaika", "drug_psy_blockade", "drug_anabiotic" }
+
+-- Shuffle table helper (Fisher-Yates)
+local function shuffle_table(t)
+    for i = #t, 2, -1 do
+        local j = math_random(i)
+        t[i], t[j] = t[j], t[i]
+    end
+    return t
+end
+
+-- Pick N random unique items from a list
+local function pick_random_items(list, count)
+    local shuffled = {}
+    for i = 1, #list do
+        shuffled[i] = list[i]
+    end
+    shuffle_table(shuffled)
+    
+    local result = {}
+    for i = 1, math.min(count, #shuffled) do
+        result[i] = shuffled[i]
+    end
+    return result
+end
+
+function spawn_baba_yaga_loot(position, difficulty_level)
+    local pos_x, pos_y, pos_z = position.x, position.y, position.z
+    local lvid = db.actor:level_vertex_id()
+    local gvid = db.actor:game_vertex_id()
+    
+    local items_to_spawn = {}
+    
+    if difficulty_level == "easy" then
+        -- Easy: zombie hand + one random artifact
+        items_to_spawn[#items_to_spawn + 1] = LOOT_ZOMBIE_HAND
+        local artifacts = pick_random_items(LOOT_ARTIFACTS, 1)
+        for i = 1, #artifacts do
+            items_to_spawn[#items_to_spawn + 1] = artifacts[i]
+        end
+        
+    elseif difficulty_level == "medium" then
+        -- Medium: controller brain + two random bonus items
+        items_to_spawn[#items_to_spawn + 1] = LOOT_CONTROLLER_BRAIN
+        local bonus = pick_random_items(LOOT_BONUS_ITEMS, 2)
+        for i = 1, #bonus do
+            items_to_spawn[#items_to_spawn + 1] = bonus[i]
+        end
+        
+    else -- hard
+        -- Hard: zombie hand + controller brain + three random bonus items
+        items_to_spawn[#items_to_spawn + 1] = LOOT_ZOMBIE_HAND
+        items_to_spawn[#items_to_spawn + 1] = LOOT_CONTROLLER_BRAIN
+        local bonus = pick_random_items(LOOT_BONUS_ITEMS, 3)
+        for i = 1, #bonus do
+            items_to_spawn[#items_to_spawn + 1] = bonus[i]
+        end
+    end
+    
+    -- Spawn all items
+    for i = 1, #items_to_spawn do
+        local spawn_pos = vector():set(
+            pos_x + math_random(-100, 100) / 100,
+            pos_y,
+            pos_z + math_random(-100, 100) / 100
+        )
+        alife_create(items_to_spawn[i], spawn_pos, lvid, gvid)
+    end
+end
+
+function monster_on_death_callback(monster)
+    -- Early exit if Baba Yaga not spawned
+    if not state.hag_id then return end
+    
+    if monster:id() == state.hag_id then
+        local hag_id = state.hag_id
+        local death_pos = monster:position()
+        
+        -- Get difficulty for loot calculation
+        local difficulty = get_difficulty()
+        
+        -- Give player brief invincibility to understand what happened
+        protect_player()
+        
+        -- Spawn loot near the body immediately (based on difficulty)
+        spawn_baba_yaga_loot(death_pos, difficulty.level)
+        
+        -- Clear hag_id for quest progression
+        state.hag_id = nil
+        
+        -- After 0.5 seconds: play effect and hide body
+        CreateTimeEvent("baba_yaga", "death_effect", 0.5, function()
+            -- Play electra effect at death location
+            local particles = particles_object("anomaly2\\effects\\electra_entrance_big")
+            particles:play_at_pos(death_pos)
+            
+            -- Play electra sound
+            local snd = sound_object("anomaly\\electra_blast1")
+            snd:play_at_pos(db.actor, death_pos, 0, sound_object.s3d)
+            
+            local particles = particles_object("anomaly2\\effects\\electra_entrance_big")
+            particles:play_at_pos(death_pos)
+			
+            -- Hide the body after another 0.5 seconds to let particles play
+            CreateTimeEvent("baba_yaga", "hide_body", 0.2, function()
+                nta_utils.hide_through_teleport(hag_id)
+                return true
+            end)
+
+            return true
+        end)
+    end
+end
+
+function on_game_start()
+    RegisterScriptCallback("save_state", save_state)
+    RegisterScriptCallback("load_state", load_state)
+    RegisterScriptCallback("actor_on_item_take", actor_on_item_take)
+    RegisterScriptCallback("monster_on_death_callback", monster_on_death_callback)
+end

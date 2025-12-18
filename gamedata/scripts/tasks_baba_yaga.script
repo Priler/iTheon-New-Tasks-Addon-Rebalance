@@ -548,6 +548,8 @@ function monster_on_death_callback(monster)
     if monster:id() == state.hag_id then
         local hag_id = state.hag_id
         local death_pos = monster:position()
+        -- Store position components (safer than storing vector reference)
+        local death_x, death_y, death_z = death_pos.x, death_pos.y, death_pos.z
         
         -- Get difficulty for loot calculation
         local difficulty = get_difficulty()
@@ -563,20 +565,38 @@ function monster_on_death_callback(monster)
         
         -- After 0.5 seconds: play effect and hide body
         CreateTimeEvent("baba_yaga", "death_effect", 0.5, function()
+            -- Safety check: make sure we're still in a valid game state
+            if not (db.actor and db.actor:alive()) then
+                return true
+            end
+            
+            -- Recreate position vector from stored components
+            local effect_pos = vector():set(death_x, death_y, death_z)
+            
             -- Play electra effect at death location
             local particles = particles_object("anomaly2\\effects\\electra_entrance_big")
-            particles:play_at_pos(death_pos)
+            if particles then
+                particles:play_at_pos(effect_pos)
+            end
             
             -- Play electra sound
             local snd = sound_object("anomaly\\electra_blast1")
-            snd:play_at_pos(db.actor, death_pos, 0, sound_object.s3d)
+            if snd then
+                snd:play_at_pos(db.actor, effect_pos, 0, sound_object.s3d)
+            end
             
-            local particles = particles_object("anomaly2\\effects\\electra_entrance_big")
-            particles:play_at_pos(death_pos)
-			
             -- Hide the body after another 0.5 seconds to let particles play
-            CreateTimeEvent("baba_yaga", "hide_body", 0.2, function()
-                nta_utils.hide_through_teleport(hag_id)
+            CreateTimeEvent("baba_yaga", "hide_body", 0.5, function()
+                -- Safety check before hiding
+                if not db.actor then
+                    return true
+                end
+                
+                -- Only try to hide if object still exists
+                local se_obj = alife_object(hag_id)
+                if se_obj then
+                    nta_utils.hide_through_teleport(hag_id)
+                end
                 return true
             end)
 

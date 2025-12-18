@@ -3,15 +3,7 @@
 -- to make it harder to cheese through looking at the map)
 -- Stage 2: Player can receive reward from the quest giver
 
--- Rewritten by: Abraham (Priler)
--- What's new:
--- added map marker for this task
--- small invictibility window while screen is black + further spawns of zombies
--- better controller spawn logic (+agro)
--- adaptive difficulty based on player armor (made for gamma but probably should work on vanilla)
--- performance optimizations (O(1) for hash table access, etc.)
-
--- Cache frequently used globals as locals (direct access)
+-- Cache frequently used globals as locals (faster access in Lua)
 local pairs = pairs
 local ipairs = ipairs
 local math_random = math.random
@@ -25,7 +17,7 @@ local state = {}
 local marker_id = nil
 
 -- Adaptive difficulty settings
--- maps armor tier to spawn percentage (1.0 = 100% of enemies spawn)
+-- Maps armor tier to spawn percentage (1.0 = 100% of enemies spawn)
 local DIFFICULTY_TIERS = {
     low = 0.5,      -- Basic gear: spawn 50% of enemies
     medium = 0.75,  -- Mid-tier gear: spawn 75% of enemies
@@ -33,7 +25,6 @@ local DIFFICULTY_TIERS = {
 }
 
 -- Armor sections considered high-tier (Exoskeletons, Nosorogs, Heavy SEVAs)
--- taken from gamma armor balance mod
 local HIGH_TIER_ARMORS = {
     -- Nosorogs
     ["army_nosorog_outfit"] = true,
@@ -117,7 +108,6 @@ local HIGH_TIER_ARMORS = {
 }
 
 -- Armor sections considered mid-tier (Combat SEVAs, Berills, Medium suits)
--- taken from gamma armor balance mod
 local MID_TIER_ARMORS = {
     -- Combat SEVAs
     ["scientific_outfit"] = true,
@@ -238,8 +228,6 @@ function load_state(mdata)
 end
 
 -- Spawn invisible marker object at the trigger location
--- mid game works fine too
--- means if the mod installed after the task taken, marker still will spawn
 function ensure_marker_exists()
     -- Check if marker already exists and is valid
     if marker_id then
@@ -254,8 +242,8 @@ function ensure_marker_exists()
     local pos = dead_night_configs.spawn_trigger
     
     -- Find suitable lvid and gvid from nearby spawn configs
-    local lvid = 139350
-    local gvid = 1159
+    local lvid = 139350  -- from your position info
+    local gvid = 1159    -- from your position info
     
     local se_obj = alife_create(spawn_section, pos, lvid, gvid)
     if se_obj then
@@ -277,23 +265,24 @@ function remove_marker()
     end
 end
 
--- Grant temporary invulnerability to player
--- just in case zombie will spawn too close and hit the player while screen is black (bruh)
+-- Protection duration in seconds
 local PROTECTION_DURATION = 5
 
+-- Grant temporary invulnerability to player
 function protect_player()
+    if not (db.actor and db.actor:alive()) then return end
+    
     db.actor.invulnerable = true
     
     -- Remove protection after delay
     CreateTimeEvent("dead_night", "remove_protection", PROTECTION_DURATION, function()
-        if db.actor then
+        if db.actor and db.actor:alive() then
             db.actor.invulnerable = false
         end
         return true  -- Remove this time event
     end)
 end
 
--- main function of the task
 task_status_functor.dead_night_task_status_functor = function(tsk, task_id)
     if not (db.actor and tsk) then return end
     local stage = tsk.stage
@@ -327,10 +316,10 @@ task_status_functor.dead_night_task_status_functor = function(tsk, task_id)
     end
 end
 
--- distance to push spawns away from player (meters)
+-- Distance to push spawns away from player (in meters)
 local SPAWN_DISTANCE_OFFSET = 15
 
--- controller spawn delay range (seconds)
+-- Controller spawn delay range (seconds)
 local CONTROLLER_DELAY_MIN = 5
 local CONTROLLER_DELAY_MAX = 10
 
@@ -338,7 +327,7 @@ function spawn()
     local actor_pos = db.actor:position()
     
     -- Play scream sound when spawn starts
-    -- nta_utils.spawn_sound_at_position([[new_tasks_addon\scream_1_shrike]], dead_night_configs.spawn_trigger)
+    nta_utils.spawn_sound_at_position([[new_tasks_addon\scream_1_shrike]], dead_night_configs.spawn_trigger)
     
     -- Get spawn multiplier based on player gear
     local spawn_multiplier = get_spawn_multiplier()
@@ -360,13 +349,13 @@ function spawn()
         end
     end
     
-    -- apply adaptive difficulty to regular spawns only
+    -- Apply adaptive difficulty to regular spawns only (always spawn special enemies)
     local num_regular_to_spawn = math_ceil(regular_count * spawn_multiplier)
     
-    -- everyday I'm shuffling, baby
+    -- Shuffle regular spawns to randomize which ones are skipped
     shuffle_table(regular_spawns)
     
-    -- spawn regular enemies
+    -- Spawn regular enemies (limited by difficulty)
     for i = 1, num_regular_to_spawn do
         local spawn_data = regular_spawns[i]
         if spawn_data then
@@ -374,7 +363,7 @@ function spawn()
         end
     end
     
-    -- spawn special enemies (blind zombies immediately, controller delayed randomly)
+    -- Spawn special enemies (blind zombies immediately, controller delayed)
     for i = 1, #special_spawns do
         local spawn_data = special_spawns[i]
         if spawn_data.section == "m_controller_normal" then
@@ -385,7 +374,15 @@ function spawn()
             local section = spawn_data.section
             
             CreateTimeEvent("dead_night", "spawn_controller_" .. math_random(1000, 9999), delay, function()
-                -- spawn controller at original position (no offset)
+                -- Safety check: make sure we're still on Darkscape
+                if not (db.actor and db.actor:alive()) then
+                    return true
+                end
+                if not nta_utils.actor_on_level(nta_utils.levels.darkscape) then
+                    return true
+                end
+                
+                -- Spawn controller at original position (no offset) for better AI pathing
                 local spawned_id = nta_utils.spawn_helper({
                     vector = config.vector,
                     lvid = config.lvid,
@@ -395,37 +392,44 @@ function spawn()
                 
                 if spawned_id then
                     state[#state + 1] = spawned_id
-                    -- start persistent aggro mechanism (idk for some reason sometimes controllers "frozes" in place without attacking the player tf)
+                    -- Start persistent aggro mechanism
                     start_controller_aggro(spawned_id)
                 end
                 return true
             end)
         else
-            -- blind zombies spawn immediately
+            -- Blind zombies spawn immediately
             spawn_single_enemy(spawn_data.config, spawn_data.section, actor_pos)
         end
     end
 end
 
--- keep controller aggressive by periodically hitting it (keep the agro)
+-- Keep controller aggressive by periodically hitting it
 function start_controller_aggro(controller_id)
     local aggro_event_id = "controller_aggro_" .. controller_id
     
     CreateTimeEvent("dead_night", aggro_event_id, 0.5, function()
-        -- Check if controller still exists and is alive
-        local monster = level_object_by_id(controller_id)
-        if not monster then
-            return true  -- Controller gone, stop aggro loop
+        -- Safety check: make sure we're in a valid game state and on the right level
+        if not (db.actor and db.actor:alive()) then
+            return true  -- Stop aggro loop
         end
         
+        -- Stop if we're not on Darkscape anymore (level transition)
+        if not nta_utils.actor_on_level(nta_utils.levels.darkscape) then
+            return true  -- Stop aggro loop
+        end
+        
+        -- Check if controller still exists and is alive
         local se_obj = alife_object(controller_id)
         if not se_obj or not se_obj:alive() then
             return true  -- Controller dead, stop aggro loop
         end
         
-        -- Check if player exists
-        if not db.actor then
-            return true  -- No player, stop
+        local monster = level_object_by_id(controller_id)
+        if not monster then
+            -- Monster not yet loaded on level, try again later
+            ResetTimeEvent("dead_night", aggro_event_id, 1.5)
+            return false
         end
         
         -- Hit the controller to maintain aggro
@@ -451,7 +455,7 @@ function start_controller_aggro(controller_id)
     end)
 end
 
--- shuffle a table randomly (Fisher-Yates algorithm)
+-- Shuffle a table randomly (Fisher-Yates algorithm)
 function shuffle_table(t)
     for i = #t, 2, -1 do
         local j = math_random(i)
@@ -512,8 +516,16 @@ function spawn_single_enemy(spawn_config, section, actor_pos, extra_offset, make
         if make_aggressive then
             -- Delay slightly to ensure monster is fully initialized
             CreateTimeEvent("dead_night", "aggro_" .. spawned_id, 0.5, function()
+                -- Safety check: make sure we're still in valid game state
+                if not (db.actor and db.actor:alive()) then
+                    return true
+                end
+                if not nta_utils.actor_on_level(nta_utils.levels.darkscape) then
+                    return true
+                end
+                
                 local monster = level_object_by_id(spawned_id)
-                if monster and db.actor then
+                if monster then
                     -- Hit the monster with tiny damage from player's direction to trigger aggro
                     local h = hit()
                     h.power = 0.001  -- Minimal damage
@@ -549,18 +561,27 @@ function spawn_sound()
     end
 end
 
--- cache for current target to avoid repeated lookups
+-- Cache for current target to avoid repeated lookups
 local cached_target_id = nil
 local cached_target_valid_until = 0
+local cached_marker_id = nil  -- Stage 0 marker never changes, cache permanently
 
 task_functor.dead_night_task_target_functor = function(task_id, field, p, tsk)
     if not (db.actor and tsk) then return nil end
     local stage = tsk.stage
     
     if stage == 0 then
-        return ensure_marker_exists()
+        -- Marker location never changes, cache permanently
+        if cached_marker_id then
+            return cached_marker_id
+        end
+        cached_marker_id = ensure_marker_exists()
+        return cached_marker_id
         
     elseif stage == 1 then
+        -- Clear stage 0 cache when entering stage 1
+        cached_marker_id = nil
+        
         if not nta_utils.actor_on_level(nta_utils.levels.darkscape) then return nil end
         
         -- Use cached target if still valid
@@ -595,6 +616,7 @@ xr_effects.dead_night_cleanup = function()
     state = {}
     cached_target_id = nil
     cached_target_valid_until = 0
+    cached_marker_id = nil
     remove_marker()
 end
 

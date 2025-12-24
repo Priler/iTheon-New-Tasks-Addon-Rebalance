@@ -1,0 +1,199 @@
+-- nta_armor_tiers.script
+-- shared armor tier detection for New Tasks Addon quests
+-- used by: tasks_baba_yaga, tasks_dead_night, tasks_house_of_horrors
+
+local pairs = pairs
+local string_sub = string.sub
+
+-- ### Armor Tier Tables
+
+-- high tier armors (exos, nosorogs, heavy suits)
+local HIGH_TIER_ARMORS = {
+    -- nosorogs
+    ["army_nosorog_outfit"] = true,
+    ["dolg_nosorog_outfit"] = true,
+    ["freedom_nosorog_outfit"] = true,
+    ["isg_nosorog_outfit"] = true,
+    ["merc_nosorog_outfit"] = true,
+    ["monolith_nosorog_outfit"] = true,
+    -- exoskeletons
+    ["exo_outfit"] = true,
+    ["bandit_exo_outfit"] = true,
+    ["cs_exo_outfit"] = true,
+    ["dolg_exo_outfit"] = true,
+    ["ecolog_exo_outfit"] = true,
+    ["greh_exo_outfit"] = true,
+    ["isg_exo_outfit"] = true,
+    ["merc_exo_outfit"] = true,
+    ["military_exo_outfit"] = true,
+    ["monolith_exo_outfit"] = true,
+    ["renegade_exo_outfit"] = true,
+    ["svoboda_exo_outfit"] = true,
+    -- exolights
+    ["exolight_outfit"] = true,
+    ["exo_wood_outfit"] = true,
+    ["bandit_exolight_outfit"] = true,
+    ["cs_exolight_outfit"] = true,
+    ["dolg_exolight_outfit"] = true,
+    ["exo_dolg_outfit"] = true,
+    ["exo_dolg_red_outfit"] = true,
+    ["exo_dolg_urban_outfit"] = true,
+    ["exo_dolg_wood_outfit"] = true,
+    ["merc_exolight_outfit"] = true,
+    ["exo_merc_grass_outfit"] = true,
+    ["exo_merc_urban_outfit"] = true,
+    ["exo_merc_wood_outfit"] = true,
+    ["isg_exolight_outfit"] = true,
+    ["military_exolight_outfit"] = true,
+    ["monolith_exolight_outfit"] = true,
+    ["svoboda_exolight_outfit"] = true,
+    ["freedom_exo_vineleaf_outfit"] = true,
+    -- proto exos
+    ["military_proto_exo_outfit"] = true,
+    ["dolg_heavy_proto_exo_outfit"] = true,
+    ["stalker_proto_exo_outfit"] = true,
+    ["cs_stalker_proto_exo_outfit"] = true,
+    ["dolg_proto_exo_outfit"] = true,
+    ["ecolog_proto_exo_outfit"] = true,
+    ["isg_proto_exo_outfit"] = true,
+    ["monolith_proto_exo_outfit"] = true,
+    ["svoboda_light_proto_exo_outfit"] = true,
+    -- skat9 / heavy military
+    ["military_outfit"] = true,
+    ["dolg_heavy_outfit"] = true,
+    ["dolg_heavy_redline_outfit"] = true,
+    ["dolg_pantsir_outfit"] = true,
+    ["military_bandit_outfit"] = true,
+    ["military_freedom_outfit"] = true,
+    ["military_merc_outfit"] = true,
+    ["military_monolit_outfit"] = true,
+    ["military_sky_outfit"] = true,
+    -- heavy metro
+    ["cs_heavy_outfit"] = true,
+    ["light_dolg_outfit"] = true,
+    ["light_freedom_outfit"] = true,
+    ["light_isg_outfit"] = true,
+    ["light_loner_outfit"] = true,
+    ["light_merc_outfit"] = true,
+    ["light_monolit_outfit"] = true,
+    ["light_voen_outfit"] = true,
+    -- battle sevas
+    ["merc_ace_outfit"] = true,
+    ["merc_combat_scientific_outfit"] = true,
+    ["hybrid_outfit"] = true,
+    -- ecologist sevas (high psy/rad protection)
+    ["ecolog_outfit_orange"] = true,
+    ["ecolog_outfit_blue"] = true,
+    ["ecolog_outfit_green"] = true,
+    ["ecolog_outfit_white"] = true,
+    ["ecolog_outfit_yello"] = true,
+    ["ecolog_outfit_red"] = true,
+}
+
+-- mid tier armors (sevas, berills, medium suits)
+local MID_TIER_ARMORS = {
+    -- combat sevas
+    ["scientific_outfit"] = true,
+    ["bandit_scientific_dark_outfit"] = true,
+    ["bandit_scientific_outfit"] = true,
+    ["cs_scientific_outfit"] = true,
+    ["cs_scientific_outfit_good"] = true,
+    ["dolg_scientific_outfit"] = true,
+    ["merc_scientific_outfit"] = true,
+    ["monolith_scientific_light_outfit"] = true,
+    ["monolith_scientific_outfit"] = true,
+    ["renegade_scientific_outfit"] = true,
+    ["svoboda_scientific_outfit"] = true,
+    ["dolg_scientific_wood_outfit"] = true,
+    ["dolg_scientific_red_outfit"] = true,
+    ["isg_scientific_outfit"] = true,
+    ["merc_scientific_armored_outfit"] = true,
+    -- berills
+    ["svoboda_heavy_outfit"] = true,
+    ["cs_medium_outfit"] = true,
+    ["dolg_voin_outfit"] = true,
+    ["specops_outfit"] = true,
+    ["dolg_specops_red_outfit"] = true,
+    ["specops_bandit_outfit"] = true,
+    ["specops_dolg_outfit"] = true,
+    ["specops_merc_outfit"] = true,
+    -- lcs (light combat suits)
+    ["merc_outfit"] = true,
+    ["merc_jackal_outfit"] = true,
+    ["merc_sunset_outfit"] = true,
+    ["merc_coyote_outfit"] = true,
+    ["greh_armored_outfit"] = true,
+    ["greh_armored_camo_outfit"] = true,
+    ["isg_lcs_outfit"] = true,
+    ["isg_lcs_urban_outfit"] = true,
+    ["renegademerc_outfit"] = true,
+    -- ps5 suits
+    ["dolg_outfit"] = true,
+    ["dolg_red_outfit"] = true,
+    ["dolg_scout_outfit"] = true,
+    ["greh_ps5_outfit"] = true,
+    ["svoboda_heavy_outfit_2"] = true,
+    ["bandit_ps5_outfit"] = true,
+    -- voyager / special medium
+    ["nomad_outfit"] = true,
+    ["travel_outfit"] = true,
+    ["wastelander_outfit"] = true,
+    ["ghillie_outfit"] = true,
+    ["merc_nighthunter_outfit"] = true,
+    -- sts tactical
+    ["bandit_sun_outfit"] = true,
+    ["isg_outfit"] = true,
+    ["isg_camo_outfit"] = true,
+    ["merc_sun_outfit"] = true,
+    ["monolith_outfit"] = true,
+    ["svoboda_light_outfit"] = true,
+    -- sunrise suits
+    ["stalker_bear_outfit"] = true,
+    ["stalker_drought_outfit"] = true,
+    ["stalker_graphite_outfit"] = true,
+    ["stalker_tigerstripe_outfit"] = true,
+    ["stalker_outfit"] = true,
+    ["stalker_autumn_outfit"] = true,
+    ["stalker_salamander_outfit"] = true,
+    ["merc_scout_outfit"] = true,
+    ["merc_fighter_outfit"] = true,
+    ["army_outfit"] = true,
+    ["cs_light_novice_outfit"] = true,
+}
+
+-- get player's armor tier: "high", "medium", or "low"
+function get_armor_tier()
+    if not db.actor then return "low" end
+    local outfit = db.actor:item_in_slot(7)
+    if not outfit then return "low" end
+    
+    local section = outfit:section()
+    
+    -- direct lookup first (fast)
+    if HIGH_TIER_ARMORS[section] then return "high" end
+    if MID_TIER_ARMORS[section] then return "medium" end
+    
+    -- check for upgraded variants (e.g. "exo_outfit_up1")
+    for armor_section in pairs(HIGH_TIER_ARMORS) do
+        if string_sub(section, 1, #armor_section) == armor_section then
+            return "high"
+        end
+    end
+    
+    for armor_section in pairs(MID_TIER_ARMORS) do
+        if string_sub(section, 1, #armor_section) == armor_section then
+            return "medium"
+        end
+    end
+    
+    return "low"
+end
+
+-- expose tables for scripts that need direct access
+function get_high_tier_table()
+    return HIGH_TIER_ARMORS
+end
+
+function get_mid_tier_table()
+    return MID_TIER_ARMORS
+end

@@ -1,0 +1,570 @@
+-- House of Horrors quest
+-- stage 0: go to haunted house in swamp at night
+-- stage 1: investigate the hanged man
+-- stage 2: kill the zombie and dogs
+-- stage 3: return to quest giver
+
+-- cached globals
+local pairs = pairs
+local math_random = math.random
+local alife_object = alife_object
+local alife_create = alife_create
+local level_object_by_id = level.object_by_id
+local CreateTimeEvent = CreateTimeEvent
+local RemoveTimeEvent = RemoveTimeEvent
+local time_global = time_global
+local string_match = string.match
+local vector = vector
+
+local configs = house_of_horrors_configs
+local outpost_smart_terrain = "mar_smart_terrain_5_12"
+
+local state = {
+    zombie_id = nil,
+    hanged_man_id = nil,
+    dog_ids = {},
+    dog_ids_lookup = {},
+    difficulty_level = nil,
+    zombie_settings = nil,
+    zombie_hits = 0,
+    zombie_shotgun_hits = 0,
+    fight_active = false,
+}
+
+-- ### Adaptive Difficulty
+
+-- use shared armor tier detection
+local function get_armor_tier()
+    return nta_armor_tiers.get_armor_tier()
+end
+
+local DIFFICULTY = {
+    easy = {
+        zombie_section = "zombie_ghost",
+        zombie_health = 100,
+        dog_section = "dog_weak_white",
+        dog_count = 1,
+    },
+    medium = {
+        zombie_section = "nta_tough_zombie_ghost",
+        zombie_health = 200,
+        dog_section = "dog_strong_black",
+        dog_count = 1,
+    },
+    hard = {
+        zombie_section = "nta_tough_zombie_ghost",
+        zombie_health = 300,
+        dog_section = "dog_strong_black",
+        dog_count = 2,
+    }
+}
+
+local function get_difficulty_level()
+    local tier = get_armor_tier()
+    if tier == "high" then
+        return "hard"
+    elseif tier == "medium" then
+        return "medium"
+    else
+        return "easy"
+    end
+end
+
+-- ### Loot System
+
+local LOOT_TABLE = {
+    easy = {
+        { section = "medkit", chance = 100 },
+    },
+    medium = {
+        { section = "medkit", chance = 100 },
+        { section = "af_ball", chance = 100 },
+    },
+    hard = {
+        { section = "medkit", chance = 100 },
+        { section = "drug_psy_blockade", chance = 100 },
+        { section = "af_ball", chance = 100 },
+    }
+}
+
+local function spawn_loot(position, difficulty_level)
+    local loot_list = LOOT_TABLE[difficulty_level]
+    if not loot_list then return end
+    
+    local pos_x, pos_y, pos_z = position.x, position.y, position.z
+    local lvid = db.actor:level_vertex_id()
+    local gvid = db.actor:game_vertex_id()
+    
+    for i = 1, #loot_list do
+        local loot = loot_list[i]
+        if math_random(100) <= loot.chance then
+            local spawn_pos = vector():set(
+                pos_x + math_random(-100, 100) / 100,
+                pos_y,
+                pos_z + math_random(-100, 100) / 100
+            )
+            alife_create(loot.section, spawn_pos, lvid, gvid)
+        end
+    end
+end
+
+function save_state(mdata)
+    mdata.house_of_horrors_task_data = state
+end
+
+function load_state(mdata)
+    if mdata.house_of_horrors_task_data then
+        state = mdata.house_of_horrors_task_data
+    end
+end
+
+task_status_functor.house_of_horrors_task_status_functor = function(tsk, task_id)
+    if not (db.actor and tsk) then return end
+    local stage = tsk.stage
+
+    if stage == 0 then
+        if nta_utils.actor_on_level(nta_utils.levels.swamp)
+            and db.actor:position():distance_to(configs.house_location.vector) < 25
+            and nta_utils.is_dark_night()
+        then
+            play_whispers()
+            state.hanged_man_id = nta_utils.spawn_helper(configs.hanged_man_location)
+            tsk.stage = 1
+        end
+        
+    elseif stage == 1 then
+        -- revert if night is over or player left swamps
+        if not nta_utils.actor_on_level(nta_utils.levels.swamp) or not nta_utils.is_dark_night() then
+            if state.hanged_man_id then
+                safe_release_manager.release({ id = state.hanged_man_id })
+                state.hanged_man_id = nil
+            end
+            tsk.stage = 0
+            return
+        end
+        
+        if db.actor:position():distance_to(configs.hanged_man_location.vector) < 3 then
+            explode_hanged_man()
+            play_screams()
+            
+            -- get difficulty and store for loot
+            local difficulty_level = get_difficulty_level()
+            state.difficulty_level = difficulty_level
+            local settings = DIFFICULTY[difficulty_level]
+            state.zombie_settings = settings
+            
+            -- spawn zombie
+            local zombie_config = {
+                section = settings.zombie_section,
+                vector = configs.zombie_location.vector,
+                lvid = configs.zombie_location.lvid,
+                gvid = configs.zombie_location.gvid
+            }
+            state.zombie_id = nta_utils.spawn_helper(zombie_config)
+            
+            -- spawn dogs
+            state.dog_ids = {}
+            state.dog_ids_lookup = {}
+            for i = 1, settings.dog_count do
+                local dog_config = {
+                    section = settings.dog_section,
+                    vector = vector():set(
+                        configs.dog_location.vector.x + (i - 1) * 2,
+                        configs.dog_location.vector.y,
+                        configs.dog_location.vector.z
+                    ),
+                    lvid = configs.dog_location.lvid,
+                    gvid = configs.dog_location.gvid
+                }
+                local dog_id = nta_utils.spawn_helper(dog_config)
+                if dog_id then
+                    state.dog_ids[#state.dog_ids + 1] = dog_id
+                    state.dog_ids_lookup[dog_id] = true
+                end
+            end
+            
+            -- activate fight mode (on_enemy_eval will handle NPC ignore)
+            scare_nearby_stalkers()
+            
+            tsk.stage = 2
+        end
+        
+    elseif stage == 2 then
+        -- teleport player back if they try to leave the house
+        local dist_to_house = db.actor:position():distance_to(configs.house_location.vector)
+        if dist_to_house > 15 then
+            teleport_to_house()
+        end
+        
+        local zombie_alive = false
+        if state.zombie_id then
+            local se_zombie = alife_object(state.zombie_id)
+            if se_zombie and se_zombie:alive() then
+                zombie_alive = true
+            end
+        end
+        
+        if not zombie_alive then
+            state.zombie_id = nil
+            tsk.stage = 3
+        end
+    end
+    -- stage 3: waiting for player to return (handled by target functor)
+end
+
+-- teleport player back to house during fight
+function teleport_to_house()
+    level.add_pp_effector("teleport.ppe", 2100, false)
+    db.actor:set_actor_position(configs.house_location.vector)
+end
+
+function explode_hanged_man()
+    if not state.hanged_man_id then return end
+    
+    local se_obj = alife_object(state.hanged_man_id)
+    if not se_obj then return end
+    
+    local pos = se_obj.position
+    nta_utils.spawn_particles_at_position("anomaly2\\body_tear_00", pos)
+    nta_utils.spawn_sound_at_position("anomaly\\anomaly_body_tear_1", pos)
+    safe_release_manager.release({ id = state.hanged_man_id })
+    state.hanged_man_id = nil
+end
+
+-- scare nearby stalkers so they wont attack zombie and cower in fear
+local SCARE_RADIUS = 50
+local DEATH_ROLL_INTERVAL = 10  -- seconds between death rolls
+local DEATH_CHANCE = 25  -- percent chance to die each roll
+local scared_npcs = {}  -- track who we scared: {id = {last_roll_time = ..., is_protected = bool}}
+
+-- psy suffering sounds (from Arszi's Controller Overhaul)
+local scared_npc_sounds = {}  -- track sounds per npc
+
+-- check if NPC is protected from death (story NPC or companion)
+local function is_protected_npc(obj)
+    local id = obj:id()
+    -- check if companion
+    if obj:has_info("npcx_is_companion") then
+        return true
+    end
+    -- check if story NPC
+    if get_object_story_id(id) then
+        return true
+    end
+    return false
+end
+
+-- kill NPC from psy damage
+local function kill_npc_psy(obj)
+    local id = obj:id()
+    
+    -- kill with psy damage
+    obj:kill(obj)
+    
+    -- cleanup
+    scared_npcs[id] = nil
+    if scared_npc_sounds[id] then
+        if scared_npc_sounds[id]:playing() then
+            scared_npc_sounds[id]:stop()
+        end
+        scared_npc_sounds[id] = nil
+    end
+end
+
+local function play_suffering_sound(obj)
+    local id = obj:id()
+    
+    -- dont play if already playing
+    if scared_npc_sounds[id] and scared_npc_sounds[id]:playing() then
+        return
+    end
+    
+    -- pick random sound (1-8 for normal, 1-3 for female)
+    local sound_path
+    if string_match(obj:section(), "devushka") then
+        sound_path = "arszi_psy\\psy_suffering_hip_" .. math_random(1, 3)
+    else
+        sound_path = "arszi_psy\\psy_suffering_" .. math_random(1, 8)
+    end
+    
+    local snd = sound_object(sound_path)
+    if snd then
+        snd:play_at_pos(obj, obj:position(), 0, sound_object.s3d)
+        snd.volume = 3
+        scared_npc_sounds[id] = snd
+    end
+end
+
+local function stop_all_suffering_sounds()
+    for id, snd in pairs(scared_npc_sounds) do
+        if snd and snd:playing() then
+            snd:stop()
+        end
+    end
+    scared_npc_sounds = {}
+end
+
+-- hit counter system - zombie dies after X hits
+-- shotgun ammo is more effective
+local HITS_TO_KILL = {
+    easy   = { regular = 15, shotgun = 6 },
+    medium = { regular = 30, shotgun = 10 },
+    hard   = { regular = 45, shotgun = 15 },
+}
+
+-- check if weapon uses shotgun ammo
+local function is_shotgun_ammo(weapon_id)
+    if not weapon_id then return false end
+    
+    local weapon = level_object_by_id(weapon_id)
+    if not weapon or not IsWeapon(weapon) then return false end
+    
+    local ammo_type_idx = weapon:get_ammo_type()
+    local ammo_list = utils_item.get_ammo(weapon:section())
+    if not ammo_list or #ammo_list == 0 then return false end
+    
+    local ammo_section = ammo_list[ammo_type_idx + 1]
+    if not ammo_section then return false end
+    
+    -- check for shotgun ammo patterns
+    if string_match(ammo_section, "buckshot") or string_match(ammo_section, "shrapnel") or string_match(ammo_section, "dart") then
+        return true
+    end
+    
+    return false
+end
+
+function scare_nearby_stalkers()
+    state.fight_active = true
+    state.zombie_hits = 0  -- reset hit counter
+    state.zombie_shotgun_hits = 0  -- reset shotgun hit counter
+    
+    local actor_pos = db.actor:position()
+    local current_time = time_global()
+    
+    for id, v in pairs(db.storage) do
+        local obj = v.object or level_object_by_id(id)
+        if obj and obj:alive() and IsStalker(obj) and obj:id() ~= AC_ID then
+            local dist = obj:position():distance_to(actor_pos)
+            if dist < SCARE_RADIUS then
+                scared_npcs[id] = {
+                    last_roll_time = current_time,
+                    is_protected = is_protected_npc(obj)
+                }
+            end
+        end
+    end
+    
+    -- keep them scared while fight is active
+    CreateTimeEvent("house_of_horrors", "keep_scared", 0.5, keep_stalkers_scared)
+end
+
+function keep_stalkers_scared()
+    if not state.fight_active then
+        -- fight over, let them return to normal
+        for id, data in pairs(scared_npcs) do
+            local obj = db.storage[id] and db.storage[id].object or level_object_by_id(id)
+            if obj and obj:alive() then
+                state_mgr.set_state(obj, "idle", nil, nil, nil, {fast_set = true})
+            end
+        end
+        scared_npcs = {}
+        stop_all_suffering_sounds()
+        return true
+    end
+    
+    local current_time = time_global()
+    local to_remove = {}  -- collect IDs to remove after iteration
+    
+    for id, data in pairs(scared_npcs) do
+        if data then
+            local obj = db.storage[id] and db.storage[id].object or level_object_by_id(id)
+            if obj and obj:alive() then
+                -- check for death roll (every 10 sec, 25% chance, only unprotected NPCs)
+                local time_since_roll = (current_time - data.last_roll_time) / 1000
+                if not data.is_protected and time_since_roll >= DEATH_ROLL_INTERVAL then
+                    data.last_roll_time = current_time
+                    if math_random(100) <= DEATH_CHANCE then
+                        kill_npc_psy(obj)
+                        to_remove[#to_remove + 1] = id
+                    end
+                else
+                    -- use psy_armed - makes them hold their head like controlled by controller
+                    state_mgr.set_state(obj, "psy_armed", nil, nil, nil, {fast_set = true})
+                    -- play suffering sound randomly
+                    if math_random(100) < 15 then  -- 15% chance each tick
+                        play_suffering_sound(obj)
+                    end
+                end
+            else
+                to_remove[#to_remove + 1] = id
+            end
+        end
+    end
+    
+    -- safe removal after iteration
+    for i = 1, #to_remove do
+        scared_npcs[to_remove[i]] = nil
+    end
+    
+    -- continue loop every 0.5 sec
+    return false
+end
+
+-- callback to make NPCs ignore our zombie and dogs
+function on_enemy_eval(obj, enemy, flags)
+    if not state.fight_active then return end
+    
+    local ene_id = enemy:id()
+    local obj_id = obj:id()
+    
+    -- if NPC is evaluating our zombie as enemy, make them ignore
+    if state.zombie_id and ene_id == state.zombie_id then
+        if obj_id ~= AC_ID then
+            flags.override = true
+            flags.result = false
+        end
+        return
+    end
+    
+    -- check if enemy is one of our dogs (O(1) lookup)
+    if state.dog_ids_lookup and state.dog_ids_lookup[ene_id] then
+        if obj_id ~= AC_ID then
+            flags.override = true
+            flags.result = false
+        end
+        return
+    end
+    
+    -- if zombie/dogs are evaluating NPCs (not player), ignore them
+    if obj_id == state.zombie_id or (state.dog_ids_lookup and state.dog_ids_lookup[obj_id]) then
+        if ene_id ~= AC_ID then
+            flags.override = true
+            flags.result = false
+        end
+    end
+end
+
+function is_our_dog(id)
+    return state.dog_ids_lookup and state.dog_ids_lookup[id] or false
+end
+
+function play_whispers()
+    nta_utils.spawn_attached_sound([[new_tasks_addon\controller_presence_l_1]])
+end
+
+function play_screams()
+    nta_utils.spawn_attached_sound([[new_tasks_addon\voc_harold_scream_2d]])
+end
+
+task_functor.house_of_horrors_task_target_functor = function(task_id, field, p, tsk)
+    if not (db.actor and tsk) then return nil end
+    local stage = tsk.stage
+
+    if stage == 0 or stage == 1 then
+        local smart = SIMBOARD:get_smart_by_name(outpost_smart_terrain)
+        return smart and smart.id or nil
+    elseif stage == 2 then
+        return state.zombie_id
+    elseif stage == 3 then
+        return tsk.task_giver_id
+    end
+    
+    return nil
+end
+
+xr_effects.house_of_horrors_cleanup = function()
+    -- stop time events
+    RemoveTimeEvent("house_of_horrors", "keep_scared")
+    
+    -- clear scared NPCs and sounds
+    stop_all_suffering_sounds()
+    scared_npcs = {}
+    
+    -- release remaining spawned objects
+    if state.hanged_man_id then
+        safe_release_manager.release({ id = state.hanged_man_id })
+    end
+    if state.dog_ids then
+        for _, dog_id in pairs(state.dog_ids) do
+            if dog_id then
+                safe_release_manager.release({ id = dog_id })
+            end
+        end
+    end
+    -- zombie should be killed by player, dont release
+    
+    state = {
+        zombie_id = nil,
+        hanged_man_id = nil,
+        dog_ids = {},
+        dog_ids_lookup = {},
+        difficulty_level = nil,
+        zombie_settings = nil,
+        zombie_hits = 0,
+        zombie_shotgun_hits = 0,
+        fight_active = false,
+    }
+end
+
+function on_game_start()
+    RegisterScriptCallback("save_state", save_state)
+    RegisterScriptCallback("load_state", load_state)
+    RegisterScriptCallback("monster_on_death_callback", monster_on_death_callback)
+    RegisterScriptCallback("monster_on_before_hit", monster_on_before_hit)
+    RegisterScriptCallback("on_enemy_eval", on_enemy_eval)
+    RegisterScriptCallback("actor_on_before_hit", actor_on_before_hit)
+end
+
+-- reduce damage from our zombie to 50%
+local ZOMBIE_DAMAGE_MULT = 0.5
+
+-- count hits on zombie and kill after threshold
+function monster_on_before_hit(monster, s_hit, bone_id, flags)
+    if not state.fight_active then return end
+    if not state.zombie_id then return end
+    if monster:id() ~= state.zombie_id then return end
+    
+    -- only count hits from player
+    local draftsman = s_hit.draftsman
+    if not draftsman or draftsman:id() ~= AC_ID then return end
+    
+    -- get difficulty thresholds
+    local thresholds = HITS_TO_KILL[state.difficulty_level] or HITS_TO_KILL.medium
+    
+    -- check if shotgun ammo
+    if is_shotgun_ammo(s_hit.weapon_id) then
+        state.zombie_shotgun_hits = (state.zombie_shotgun_hits or 0) + 1
+        if state.zombie_shotgun_hits >= thresholds.shotgun then
+            monster:kill(db.actor)
+        end
+    else
+        state.zombie_hits = (state.zombie_hits or 0) + 1
+        if state.zombie_hits >= thresholds.regular then
+            monster:kill(db.actor)
+        end
+    end
+end
+
+function actor_on_before_hit(s_hit, bone_id, flags)
+    if not state.fight_active then return end
+    if not state.zombie_id then return end
+    
+    -- check if hit is from our zombie
+    local draftsman = s_hit.draftsman
+    if draftsman and draftsman:id() == state.zombie_id then
+        s_hit.power = s_hit.power * ZOMBIE_DAMAGE_MULT
+    end
+end
+
+function monster_on_death_callback(monster)
+    if not state.zombie_id then return end
+    
+    if monster:id() == state.zombie_id then
+        local death_pos = monster:position()
+        spawn_loot(death_pos, state.difficulty_level or "medium")
+        
+        -- disable fight mode when zombie dies
+        state.fight_active = false
+    end
+end
